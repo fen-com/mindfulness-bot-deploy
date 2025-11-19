@@ -27,17 +27,17 @@ log = logging.getLogger(__name__)
 
 USERS_FILE = "users.json"
 
-# Токен бота берём из переменной окружения (Render: Settings → Environment → BOT_TOKEN)
+# Токен бота из переменной окружения (Render: Settings → Environment → BOT_TOKEN)
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# Публичный URL сервиса (для Render можно задать PUBLIC_URL, иначе fallback)
+# Публичный URL (Render: PUBLIC_URL = https://mindfulness-bot.onrender.com)
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://mindfulness-bot.onrender.com").rstrip("/")
 
-# Секретный путь webhook’а
+# Секрет для webhook-пути
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mindfulness-secret")
 
-# Порт, на котором должен слушать сервис (Render даёт PORT, локально можно 10000)
-PORT = int(os.getenv("PORT", "10000"))
+# Порт сервиса (Render сам проставит PORT)
+PORT = int(os.getenv("PORT", "1000"))
 
 MIN_COUNT = 3
 MAX_COUNT = 10
@@ -63,11 +63,11 @@ class UserSettings:
     start_hour: int = DEFAULT_START      # начальный час (локальный)
     end_hour: int = DEFAULT_END          # конечный час (локальный)
     count: int = DEFAULT_COUNT           # уведомлений в день
-    enabled: bool = True                 # включён ли бот для этого юзера
+    enabled: bool = True                 # включён ли бот
 
     planned_today: int = 0               # сколько уведомлений запланировано на сегодня
     sent_today: int = 0                  # сколько уже отправлено сегодня
-    last_plan_date_utc: Optional[str] = None  # дата (UTC), на которую был последний план
+    last_plan_date_utc: Optional[str] = None  # дата (UTC) последнего плана
 
 
 USERS: Dict[int, UserSettings] = {}
@@ -186,7 +186,7 @@ def plan_today(app, uid: int, settings: UserSettings) -> None:
             name=f"msg_{uid}",
             data={"uid": uid},
             job_kwargs={
-                # если бот/сервер спал – всё равно шлём, даже если время прошло
+                # если сервер спал – всё равно шлём, даже если время прошло
                 "misfire_grace_time": 60 * 60 * 24,  # 24 часа
                 "coalesce": False,
             },
@@ -338,7 +338,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     upcoming_local_times = []
     for job in scheduler.get_jobs():
         if job.name == f"msg_{uid}" and job.next_run_time is not None:
-            # next_run_time у apscheduler — наивный UTC
             run_utc = job.next_run_time.replace(tzinfo=timezone.utc)
             run_local = run_utc.astimezone(tz)
             if run_local.date() == today_local:
@@ -488,7 +487,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
 
-# ===================== STARTUP (Render + webhook) =====================
+# ===================== STARTUP (webhook) =====================
 
 async def on_startup(app) -> None:
     """
@@ -510,10 +509,8 @@ def main() -> None:
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # хук на инициализацию (внутри run_webhook он выполнится один раз)
     app.post_init = on_startup
 
-    # хендлеры
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("settz", cmd_settz))
     app.add_handler(CommandHandler("settime", cmd_settime))
@@ -522,7 +519,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     webhook_url = f"{PUBLIC_URL}/{WEBHOOK_SECRET}"
-    log.info("Starting webhook on port %s, url: %s", PORT, webhook_url)
+    log.info("Starting webhook on port %s, url: https://mindfulness-bot.onrender.com/%s", PORT, WEBHOOK_SECRET)
 
     app.run_webhook(
         listen="0.0.0.0",
