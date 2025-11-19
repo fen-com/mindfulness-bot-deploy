@@ -6,21 +6,16 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, time, timedelta, timezone
 from typing import Dict, Optional
 
-from flask import Flask, request
-
 from telegram import Update
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    JobQueue,
     filters,
 )
 
-# =====================================================
-# ЛОГИ
-# =====================================================
+# ===================== ЛОГИ =====================
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -28,24 +23,28 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# =====================================================
-# КОНСТАНТЫ
-# =====================================================
+# ===================== КОНСТАНТЫ =====================
 
 USERS_FILE = "users.json"
 
-TOKEN = os.getenv("BOT_TOKEN")   # токен из переменной окружения Render
-WEBHOOK_SECRET = "mindfulness-secret"  # путь вебхука
+# Токен бота берём из переменной окружения (Render: Settings → Environment → BOT_TOKEN)
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# например: mindfulness-bot.onrender.com (БЕЗ https://)
-RENDER_URL = os.getenv("RENDER_URL")
+# Публичный URL сервиса (для Render можно задать PUBLIC_URL, иначе fallback)
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://mindfulness-bot.onrender.com").rstrip("/")
+
+# Секретный путь webhook’а
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mindfulness-secret")
+
+# Порт, на котором должен слушать сервис (Render даёт PORT, локально можно 10000)
+PORT = int(os.getenv("PORT", "10000"))
 
 MIN_COUNT = 3
 MAX_COUNT = 10
 
-DEFAULT_TZ = 0
-DEFAULT_START = 9
-DEFAULT_END = 19
+DEFAULT_TZ = 0        # GMT+0
+DEFAULT_START = 9     # 9:00
+DEFAULT_END = 19      # 19:00
 DEFAULT_COUNT = 5
 
 PROMPTS = [
@@ -56,81 +55,101 @@ PROMPTS = [
     "Чем бы ты занялся, если бы был на 5% более осознанным прямо сейчас?",
 ]
 
-# =====================================================
-# МОДЕЛЬ ПОЛЬЗОВАТЕЛЯ
-# =====================================================
+# ===================== МОДЕЛЬ ПОЛЬЗОВАТЕЛЯ =====================
 
 @dataclass
 class UserSettings:
-    tz_offset: int = DEFAULT_TZ
-    start_hour: int = DEFAULT_START
-    end_hour: int = DEFAULT_END
-    count: int = DEFAULT_COUNT
-    enabled: bool = True
+    tz_offset: int = DEFAULT_TZ          # сдвиг GMT, например +11
+    start_hour: int = DEFAULT_START      # начальный час (локальный)
+    end_hour: int = DEFAULT_END          # конечный час (локальный)
+    count: int = DEFAULT_COUNT           # уведомлений в день
+    enabled: bool = True                 # включён ли бот для этого юзера
 
-    planned_today: int = 0
-    sent_today: int = 0
-    last_plan_date_utc: Optional[str] = None
+    planned_today: int = 0               # сколько уведомлений запланировано на сегодня
+    sent_today: int = 0                  # сколько уже отправлено сегодня
+    last_plan_date_utc: Optional[str] = None  # дата (UTC), на которую был последний план
 
 
 USERS: Dict[int, UserSettings] = {}
 
-# =====================================================
-# РАБОТА С ФАЙЛОМ
-# =====================================================
+# ===================== РАБОТА С ФАЙЛОМ =====================
 
 def load_users() -> None:
     global USERS
     if not os.path.exists(USERS_FILE):
+        log.info("Users file not found, starting fresh")
         USERS = {}
         return
 
     try:
         with open(USERS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            raw = json.load(f)
     except Exception as e:
         log.error("Failed to load users: %s", e)
         USERS = {}
         return
 
     tmp: Dict[int, UserSettings] = {}
-    for uid_str, v in data.items():
+    for uid_str, data in raw.items():
         try:
             uid = int(uid_str)
-            tmp[uid] = UserSettings(**v)
-        except Exception as e:
-            log.error("Failed to load user %s: %s", uid_str, e)
+        except ValueError:
+            continue
+
+        if not isinstance(data, dict):
+            continue
+
+        migrated = dict(data)
+
+        # миграция старых полей
+        if "tz" in migrated and "tz_offset" not in migrated:
+            migrated["tz_offset"] = migrated["tz"]
+        if "start" in migrated and "start_hour" not in migrated:
+            migrated["start_hour"] = migrated["start"]
+        if "end" in migrated and "end_hour" not in migrated:
+            migrated["end_hour"] = migrated["end"]
+
+        allowed_keys = UserSettings.__dataclass_fields__.keys()
+        clean_data = {k: v for k, v in migrated.items() if k in allowed_keys}
+
+        try:
+            tmp[uid] = UserSettings(**clean_data)
+        except TypeError as e:
+            log.error("Failed to load user %s: %s", uid, e)
+
     USERS = tmp
     log.info("Loaded %d users", len(USERS))
 
 
 def save_users() -> None:
     try:
-        data = {str(uid): asdict(s) for uid, s in USERS.items()}
+        data = {str(uid): asdict(settings) for uid, settings in USERS.items()}
         with open(USERS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.error("Failed to save users: %s", e)
 
 
-# =====================================================
-# ВСПОМОГАТЕЛЬНОЕ
-# =====================================================
+# ===================== ВСПОМОГАТЕЛЬНОЕ =====================
 
 def get_user_tz(settings: UserSettings) -> timezone:
     return timezone(timedelta(hours=settings.tz_offset))
 
 
-def clear_user_jobs(app: Application, uid: int) -> None:
-    """Удаляем все задачи сообщений и полуночи для юзера."""
-    scheduler = app.job_queue.scheduler
+def clear_user_jobs(app, uid: int) -> None:
+    """Удаляем все джобы сообщений и полуночи для этого пользователя."""
+    jq = app.job_queue
+    scheduler = jq.scheduler
     for job in scheduler.get_jobs():
         if job.name in (f"msg_{uid}", f"midnight_{uid}"):
             job.remove()
 
 
-def plan_today(app: Application, uid: int, settings: UserSettings) -> None:
-    """Планируем уведомления на сегодняшний день."""
+def plan_today(app, uid: int, settings: UserSettings) -> None:
+    """
+    Планирует уведомления на сегодня для пользователя.
+    Работает в UTC, учитывая локальный tz пользователя.
+    """
     tz = get_user_tz(settings)
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone(tz)
@@ -145,7 +164,7 @@ def plan_today(app: Application, uid: int, settings: UserSettings) -> None:
     for _ in range(settings.count):
         h = random.randint(start, end - 1)
         m = random.randint(0, 59)
-        dt_loc = datetime.combine(today_local, time(h, m), tzinfo=tz)
+        dt_loc = datetime.combine(today_local, time(h, m, 0), tzinfo=tz)
         times_local.append(dt_loc)
 
     times_local.sort()
@@ -158,25 +177,27 @@ def plan_today(app: Application, uid: int, settings: UserSettings) -> None:
     jq = app.job_queue
 
     for dt_loc in times_local:
-        dt_utc = dt_loc.astimezone(timezone.utc).replace(tzinfo=None)
+        dt_utc = dt_loc.astimezone(timezone.utc)
+        dt_utc_naive = dt_utc.replace(tzinfo=None)
 
         jq.run_once(
             callback=job_send_message,
-            when=dt_utc,
+            when=dt_utc_naive,
             name=f"msg_{uid}",
             data={"uid": uid},
             job_kwargs={
+                # если бот/сервер спал – всё равно шлём, даже если время прошло
                 "misfire_grace_time": 60 * 60 * 24,  # 24 часа
                 "coalesce": False,
             },
         )
-        log.info("Scheduled msg for %s at %s", uid, dt_utc.isoformat())
+        log.info("Scheduled msg for %s at %s", uid, dt_utc_naive.isoformat())
 
     log.info("[%s] %d msgs planned for today", uid, settings.planned_today)
 
 
-def schedule_midnight(app: Application, uid: int, settings: UserSettings) -> None:
-    """Ставит задачу на локальную полночь юзера -> план следующего дня."""
+def schedule_midnight(app, uid: int, settings: UserSettings) -> None:
+    """Ставит джобу на локальную полночь пользователя, чтобы спланировать следующий день."""
     tz = get_user_tz(settings)
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone(tz)
@@ -200,9 +221,7 @@ def schedule_midnight(app: Application, uid: int, settings: UserSettings) -> Non
     log.info("[%s] midnight job -> %s", uid, next_midnight_utc_naive.isoformat())
 
 
-# =====================================================
-# JOB CALLBACKS
-# =====================================================
+# ===================== JOB CALLBACKS =====================
 
 async def job_send_message(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
@@ -224,6 +243,7 @@ async def job_send_message(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def job_midnight(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Полночь в локальном времени пользователя: планируем новый день и ставим следующую полночь."""
     job = context.job
     uid = job.data["uid"]
     app = context.application
@@ -239,9 +259,7 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Midnight job executed for %s", uid)
 
 
-# =====================================================
-# КОМАНДЫ
-# =====================================================
+# ===================== КОМАНДЫ =====================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -272,30 +290,37 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_settz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    user = update.effective_user
+    if not user or not update.message:
         return
+
     context.user_data["mode"] = "set_tz"
     await update.message.reply_text("Пришли GMT, например +11")
 
 
 async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    user = update.effective_user
+    if not user or not update.message:
         return
+
     context.user_data["mode"] = "set_time"
     await update.message.reply_text("Пришли диапазон: начало конец (пример: 9 19)")
 
 
 async def cmd_setcount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    user = update.effective_user
+    if not user or not update.message:
         return
+
     context.user_data["mode"] = "set_count"
     await update.message.reply_text("Пришли количество уведомлений (3–10).")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
+    user = update.effective_user
+    if not user or not update.message:
         return
-    uid = update.effective_user.id
+    uid = user.id
 
     settings = USERS.get(uid)
     if not settings:
@@ -313,6 +338,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     upcoming_local_times = []
     for job in scheduler.get_jobs():
         if job.name == f"msg_{uid}" and job.next_run_time is not None:
+            # next_run_time у apscheduler — наивный UTC
             run_utc = job.next_run_time.replace(tzinfo=timezone.utc)
             run_local = run_utc.astimezone(tz)
             if run_local.date() == today_local:
@@ -329,6 +355,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines.append(f"Часовой пояс: GMT{settings.tz_offset:+d}")
     lines.append(f"Диапазон: {settings.start_hour}–{settings.end_hour}")
     lines.append(f"Уведомлений в день: {settings.count}\n")
+
     lines.append(f"Сегодня отправлено: {sent}")
     lines.append(f"Осталось: {remaining}\n")
 
@@ -343,20 +370,22 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         elif remaining == 0:
             lines.append("На сегодня все уведомления уже отправлены.")
         else:
-            lines.append("В очереди уведомлений не видно (возможно, всё уже разослано).")
+            lines.append(
+                "На сегодня запланированных уведомлений в очереди не видно "
+                "(возможно, всё уже разослано)."
+            )
 
     await update.message.reply_text("\n".join(lines))
 
 
-# =====================================================
-# ОБРАБОТКА ТЕКСТА (настройки)
-# =====================================================
+# ===================== ОБРАБОТКА ТЕКСТА (настройки) =====================
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
 
-    uid = update.effective_user.id
+    user = update.effective_user
+    uid = user.id
     text = update.message.text.strip()
 
     mode = context.user_data.get("mode")
@@ -372,13 +401,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if mode == "set_tz":
         try:
-            if text.lower().startswith("gmt"):
+            if text.startswith("GMT") or text.startswith("gmt"):
                 text_clean = text[3:].strip()
             else:
                 text_clean = text
+
             tz_val = int(text_clean)
         except ValueError:
-            await update.message.reply_text("Неверный формат. Пример: +11")
+            await update.message.reply_text("Неверный формат. Попробуй ещё раз. Пример: +11")
             return
 
         if tz_val < -12 or tz_val > 14:
@@ -458,68 +488,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
 
-# =====================================================
-# WEBHOOK + FLASK
-# =====================================================
+# ===================== STARTUP (Render + webhook) =====================
 
-app_flask = Flask(__name__)
-telegram_app: Optional[Application] = None
-
-
-@app_flask.post(f"/{WEBHOOK_SECRET}")
-def webhook() -> tuple[str, int]:
-    global telegram_app
-    if telegram_app is None:
-        return "App not ready", 500
-
-    data = request.get_json(force=True)
-    update = Update.de_json(data, telegram_app.bot)
-    telegram_app.update_queue.put_nowait(update)
-    return "OK", 200
-
-
-def start_bot() -> None:
-    global telegram_app
-
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN not set")
-
+async def on_startup(app) -> None:
+    """
+    При старте:
+    - грузим пользователей
+    - для каждого планируем день и полуночь.
+    """
     load_users()
-
-    # ВАЖНО: updater(None) — чтобы НЕ создавать Updater и не ловить ошибку
-    telegram_app = (
-        Application.builder()
-        .token(TOKEN)
-        .updater(None)
-        .build()
-    )
-
-    # Настраиваем JobQueue на UTC
-    telegram_app.job_queue.scheduler.configure(timezone="UTC")
-
-    # Хэндлеры
-    telegram_app.add_handler(CommandHandler("start", cmd_start))
-    telegram_app.add_handler(CommandHandler("settz", cmd_settz))
-    telegram_app.add_handler(CommandHandler("settime", cmd_settime))
-    telegram_app.add_handler(CommandHandler("setcount", cmd_setcount))
-    telegram_app.add_handler(CommandHandler("status", cmd_status))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    telegram_app.initialize()
-    telegram_app.start()
-
-    if not RENDER_URL:
-        raise RuntimeError("RENDER_URL not set")
-
-    hook_url = f"https://{RENDER_URL}/{WEBHOOK_SECRET}"
-    telegram_app.bot.set_webhook(url=hook_url)
-    log.info("Webhook set to %s", hook_url)
+    for uid, settings in USERS.items():
+        clear_user_jobs(app, uid)
+        plan_today(app, uid, settings)
+        schedule_midnight(app, uid, settings)
+    log.info("Startup: users planned and midnight jobs scheduled")
 
 
 def main() -> None:
-    start_bot()
-    port = int(os.getenv("PORT", 5000))
-    app_flask.run(host="0.0.0.0", port=port)
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
+
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # хук на инициализацию (внутри run_webhook он выполнится один раз)
+    app.post_init = on_startup
+
+    # хендлеры
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("settz", cmd_settz))
+    app.add_handler(CommandHandler("settime", cmd_settime))
+    app.add_handler(CommandHandler("setcount", cmd_setcount))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    webhook_url = f"{PUBLIC_URL}/{WEBHOOK_SECRET}"
+    log.info("Starting webhook on port %s, url: %s", PORT, webhook_url)
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_SECRET,
+        webhook_url=webhook_url,
+    )
 
 
 if __name__ == "__main__":
