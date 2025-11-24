@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import random
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import dataclass, asdict
 from datetime import datetime, time, timedelta, timezone
 from typing import Dict, Optional
@@ -26,19 +28,17 @@ log = logging.getLogger(__name__)
 # ===================== КОНСТАНТЫ =====================
 
 USERS_FILE = "users.json"
-
-# Токен из переменной окружения (Render: Environment → BOT_TOKEN)
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
 MIN_COUNT = 3
 MAX_COUNT = 10
 
-DEFAULT_TZ = 0        # GMT+0
-DEFAULT_START = 9     # 9:00
-DEFAULT_END = 19      # 19:00
+DEFAULT_TZ = 0
+DEFAULT_START = 9
+DEFAULT_END = 19
 DEFAULT_COUNT = 5
 
-# На сколько минут вперёд от "прямо сейчас" можно ставить самое раннее напоминание
+# чтобы рендер не отбрасывал слишком старые джобы
 MIN_OFFSET_MINUTES = 5
 
 PROMPTS = [
@@ -53,15 +53,15 @@ PROMPTS = [
 
 @dataclass
 class UserSettings:
-    tz_offset: int = DEFAULT_TZ          # сдвиг GMT, например +11
-    start_hour: int = DEFAULT_START      # начальный час (локальный)
-    end_hour: int = DEFAULT_END          # конечный час (локальный)
-    count: int = DEFAULT_COUNT           # сколько уведомлений в день
-    enabled: bool = True                 # включён ли бот для этого юзера
+    tz_offset: int = DEFAULT_TZ
+    start_hour: int = DEFAULT_START
+    end_hour: int = DEFAULT_END
+    count: int = DEFAULT_COUNT
+    enabled: bool = True
 
-    planned_today: int = 0               # целевое количество на сегодня
-    sent_today: int = 0                  # сколько уже отправлено сегодня
-    last_plan_date_utc: Optional[str] = None  # дата (UTC), на которую был последний план
+    planned_today: int = 0
+    sent_today: int = 0
+    last_plan_date_utc: Optional[str] = None
 
 
 USERS: Dict[int, UserSettings] = {}
@@ -71,7 +71,6 @@ USERS: Dict[int, UserSettings] = {}
 def load_users() -> None:
     global USERS
     if not os.path.exists(USERS_FILE):
-        log.info("Users file not found, starting fresh")
         USERS = {}
         return
 
@@ -83,11 +82,11 @@ def load_users() -> None:
         USERS = {}
         return
 
-    tmp: Dict[int, UserSettings] = {}
+    tmp = {}
     for uid_str, data in raw.items():
         try:
             uid = int(uid_str)
-        except ValueError:
+        except:
             continue
 
         if not isinstance(data, dict):
@@ -95,7 +94,6 @@ def load_users() -> None:
 
         migrated = dict(data)
 
-        # миграция старых полей
         if "tz" in migrated and "tz_offset" not in migrated:
             migrated["tz_offset"] = migrated["tz"]
         if "start" in migrated and "start_hour" not in migrated:
@@ -103,12 +101,12 @@ def load_users() -> None:
         if "end" in migrated and "end_hour" not in migrated:
             migrated["end_hour"] = migrated["end"]
 
-        allowed_keys = UserSettings.__dataclass_fields__.keys()
-        clean_data = {k: v for k, v in migrated.items() if k in allowed_keys}
+        allowed = UserSettings.__dataclass_fields__.keys()
+        clean = {k: v for k, v in migrated.items() if k in allowed}
 
         try:
-            tmp[uid] = UserSettings(**clean_data)
-        except TypeError as e:
+            tmp[uid] = UserSettings(**clean)
+        except Exception as e:
             log.error("Failed to load user %s: %s", uid, e)
 
     USERS = tmp
@@ -117,21 +115,18 @@ def load_users() -> None:
 
 def save_users() -> None:
     try:
-        data = {str(uid): asdict(settings) for uid, settings in USERS.items()}
+        data = {str(uid): asdict(s) for uid, s in USERS.items()}
         with open(USERS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.error("Failed to save users: %s", e)
-
 
 # ===================== ВСПОМОГАТЕЛЬНОЕ =====================
 
 def get_user_tz(settings: UserSettings) -> timezone:
     return timezone(timedelta(hours=settings.tz_offset))
 
-
 def clear_user_jobs(app: Application, uid: int) -> None:
-    """Удаляем все джобы сообщений и полуночи для этого пользователя."""
     jq = app.job_queue
     scheduler = jq.scheduler
     for job in scheduler.get_jobs():
@@ -140,200 +135,138 @@ def clear_user_jobs(app: Application, uid: int) -> None:
 
 
 def plan_today(app: Application, uid: int, settings: UserSettings, reset_sent: bool) -> None:
-    """
-    Планирует уведомления на сегодня для пользователя.
-
-    Логика:
-    - Если новый день (по UTC) или reset_sent=True:
-        - sent_today = 0
-        - planned_today = settings.count
-    - Если день тот же и reset_sent=False:
-        - НЕ переопределяем planned_today (сохраняем старый план)
-        - гарантируем, что planned_today >= sent_today
-    - Всегда планируем ТОЛЬКО недостающие уведомления:
-        remaining_to_plan = planned_today - sent_today
-
-    Напоминания ставятся только в будущее (>= now + MIN_OFFSET_MINUTES).
-    """
-    tz = get_user_tz(settings)
     now_utc = datetime.now(timezone.utc)
     today_utc = now_utc.date()
     today_utc_str = today_utc.isoformat()
 
+    tz = get_user_tz(settings)
     now_local = now_utc.astimezone(tz)
     today_local = now_local.date()
 
-    # Окно в локальном времени
-    start_hour = settings.start_hour
-    end_hour = settings.end_hour
-    if start_hour >= end_hour:
-        start_hour, end_hour = DEFAULT_START, DEFAULT_END
+    start_h = settings.start_hour
+    end_h = settings.end_hour
+    if start_h >= end_h:
+        start_h, end_h = DEFAULT_START, DEFAULT_END
 
-    start_dt_local = datetime.combine(today_local, time(start_hour, 0), tzinfo=tz)
-    end_dt_local = datetime.combine(today_local, time(end_hour, 0), tzinfo=tz)
+    start_dt_local = datetime.combine(today_local, time(start_h, 0), tzinfo=tz)
+    end_dt_local = datetime.combine(today_local, time(end_h, 0), tzinfo=tz)
 
-    # Новый день или принудительный сброс
     if reset_sent or settings.last_plan_date_utc != today_utc_str:
         settings.sent_today = 0
         settings.planned_today = settings.count
         settings.last_plan_date_utc = today_utc_str
-        log.info(
-            "[%s] New day or reset: planned_today=%d, sent_today=%d",
-            uid, settings.planned_today, settings.sent_today
-        )
+        log.info("[%s] New day: planned_today=%d", uid, settings.planned_today)
     else:
-        # День тот же, рестарт/перепланировка
         if settings.planned_today < settings.sent_today:
             settings.planned_today = settings.sent_today
         if settings.planned_today == 0:
             settings.planned_today = settings.count
 
-        log.info(
-            "[%s] Same-day replan: keep planned_today=%d, sent_today=%d",
-            uid, settings.planned_today, settings.sent_today
-        )
-
-    # Нижняя граница для новых напоминаний:
     min_dt_local = now_local + timedelta(minutes=MIN_OFFSET_MINUTES)
     window_start = max(start_dt_local, min_dt_local)
 
     if window_start >= end_dt_local:
-        # На сегодня времени не осталось
         save_users()
-        log.info(
-            "[%s] No time left today for new messages (%s–%s local, now_local=%s)",
-            uid,
-            start_dt_local.isoformat(),
-            end_dt_local.isoformat(),
-            now_local.isoformat(),
-        )
+        log.info("[%s] No window left for today", uid)
         return
 
-    remaining_to_plan = max(settings.planned_today - settings.sent_today, 0)
-    if remaining_to_plan <= 0:
+    remaining = max(settings.planned_today - settings.sent_today, 0)
+    if remaining <= 0:
         save_users()
-        log.info(
-            "[%s] Already reached daily target: planned_today=%d, sent_today=%d",
-            uid, settings.planned_today, settings.sent_today
-        )
+        log.info("[%s] Already delivered all planned", uid)
         return
 
     total_minutes = int((end_dt_local - window_start).total_seconds() // 60)
     if total_minutes <= 0:
         save_users()
-        log.info("[%s] No minute window left today", uid)
         return
 
-    times_local = []
-    for _ in range(remaining_to_plan):
-        offset_min = random.randint(0, total_minutes - 1)
-        dt_loc = window_start + timedelta(minutes=offset_min)
-        times_local.append(dt_loc)
-
-    times_local.sort()
     jq = app.job_queue
+    times = []
 
-    for dt_loc in times_local:
-        dt_utc = dt_loc.astimezone(timezone.utc)
+    for _ in range(remaining):
+        offset = random.randint(0, total_minutes - 1)
+        dt_local = window_start + timedelta(minutes=offset)
+        times.append(dt_local)
+
+    times.sort()
+
+    for dt_local in times:
+        dt_utc = dt_local.astimezone(timezone.utc)
         dt_utc_naive = dt_utc.replace(tzinfo=None)
 
         jq.run_once(
-            callback=job_send_message,
+            job_send_message,
             when=dt_utc_naive,
             name=f"msg_{uid}",
             data={"uid": uid},
             job_kwargs={
-                # если опоздали не больше, чем на MIN_OFFSET_MINUTES — всё ещё шлём
                 "misfire_grace_time": MIN_OFFSET_MINUTES * 60,
                 "coalesce": False,
             },
         )
-        log.info("Scheduled msg for %s at %s (UTC naive)", uid, dt_utc_naive.isoformat())
-
-    log.info(
-        "[%s] %d msgs planned for today (sent_today=%d, planned_today=%d, window %02d-%02d local)",
-        uid, remaining_to_plan, settings.sent_today, settings.planned_today,
-        start_hour, end_hour
-    )
+        log.info("Scheduled msg for %s at %s UTC", uid, dt_utc_naive)
 
     save_users()
 
 
 def schedule_midnight(app: Application, uid: int, settings: UserSettings) -> None:
-    """Ставит джобу на локальную полночь пользователя, чтобы спланировать следующий день."""
     tz = get_user_tz(settings)
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone(tz)
 
-    next_midnight_local = datetime.combine(
-        now_local.date(), time(0, 0), tzinfo=tz
-    ) + timedelta(days=1)
-
+    next_midnight_local = datetime.combine(today := now_local.date(), time(0, 0), tzinfo=tz) + timedelta(days=1)
     next_midnight_utc = next_midnight_local.astimezone(timezone.utc)
-    next_midnight_utc_naive = next_midnight_utc.replace(tzinfo=None)
+    naive = next_midnight_utc.replace(tzinfo=None)
 
     app.job_queue.run_once(
-        callback=job_midnight,
-        when=next_midnight_utc_naive,
+        job_midnight,
+        when=naive,
         name=f"midnight_{uid}",
         data={"uid": uid},
         job_kwargs={
-            # полуночная джоба не должна отваливаться, даже если сервис проснулся сильно позже
-            "misfire_grace_time": 60 * 60 * 24,  # 24 часа
+            "misfire_grace_time": MIN_OFFSET_MINUTES * 60,
             "coalesce": False,
         },
     )
-    log.info("[%s] midnight job -> %s", uid, next_midnight_utc_naive.isoformat())
+    log.info("[%s] midnight scheduled at %s", uid, naive)
 
 
 # ===================== JOB CALLBACKS =====================
 
 async def job_send_message(context: ContextTypes.DEFAULT_TYPE) -> None:
-    job = context.job
-    uid = job.data["uid"]
+    uid = context.job.data["uid"]
     settings = USERS.get(uid)
-
     if not settings or not settings.enabled:
-        log.info("job_send_message: user %s disabled or missing", uid)
         return
 
     text = random.choice(PROMPTS)
     try:
-        await context.bot.send_message(chat_id=uid, text=text)
+        await context.bot.send_message(uid, text)
         settings.sent_today += 1
         save_users()
-        log.info(
-            "Sent msg to %s. Sent today: %d (planned_today=%d)",
-            uid, settings.sent_today, settings.planned_today
-        )
+        log.info("Sent to %s (%d/%d)", uid, settings.sent_today, settings.planned_today)
     except Exception as e:
-        log.error("Failed to send message to %s: %s", uid, e)
+        log.error("Send fail to %s: %s", uid, e)
 
 
 async def job_midnight(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Полночь в локальном времени пользователя: планируем новый день и ставим следующую полночь."""
-    job = context.job
-    uid = job.data["uid"]
+    uid = context.job.data["uid"]
     app = context.application
     settings = USERS.get(uid)
-
     if not settings:
-        log.info("midnight job: user %s not found", uid)
         return
 
     clear_user_jobs(app, uid)
-    # Новый день – сбрасываем sent_today и пересоздаём дневной план
     plan_today(app, uid, settings, reset_sent=True)
     schedule_midnight(app, uid, settings)
-    log.info("Midnight job executed for %s", uid)
 
 
 # ===================== КОМАНДЫ =====================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not user or not update.message:
-        return
+    if not user: return
     uid = user.id
 
     settings = USERS.get(uid)
@@ -343,56 +276,46 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         save_users()
 
     app = context.application
-
     clear_user_jobs(app, uid)
-    # /start — перепланируем только остаток дня, не сбрасывая счётчик
+
     plan_today(app, uid, settings, reset_sent=False)
     schedule_midnight(app, uid, settings)
 
-    text = (
+    await update.message.reply_text(
         "✨ Бот запущен!\n\n"
         "Чтобы всё работало корректно — установи часовой пояс через /settz.\n"
         "И диапазон времени через /settime.\n\n"
         "Я уже работаю и буду слать уведомления каждый день.\n"
         "Посмотреть текущие настройки можно через /status."
     )
-    await update.message.reply_text(text)
 
 
-async def cmd_settz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not update.message:
-        return
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(timezone.utc)
+    await update.message.reply_text(f"pong ✅\nUTC: {now.isoformat()}")
 
+
+async def cmd_settz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = "set_tz"
     await update.message.reply_text("Пришли GMT, например +11")
 
 
-async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not update.message:
-        return
-
+async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = "set_time"
     await update.message.reply_text("Пришли диапазон: начало конец (пример: 9 19)")
 
 
-async def cmd_setcount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not update.message:
-        return
-
+async def cmd_setcount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = "set_count"
     await update.message.reply_text("Пришли количество уведомлений (3–10).")
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not user or not update.message:
-        return
+    if not user: return
     uid = user.id
-
     settings = USERS.get(uid)
+
     if not settings:
         await update.message.reply_text("Я тебя ещё не знаю. Набери /start.")
         return
@@ -400,246 +323,206 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     tz = get_user_tz(settings)
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone(tz)
-    today_local = now_local.date()
+    today = now_local.date()
 
-    jq = context.application.job_queue
-    scheduler = jq.scheduler
+    jq = context.application.job_queue.scheduler
+    upcoming = []
 
-    upcoming_local_times = []
-    for job in scheduler.get_jobs():
-        if job.name == f"msg_{uid}" and job.next_run_time is not None:
-            run_utc = job.next_run_time.replace(tzinfo=timezone.utc)
-            run_local = run_utc.astimezone(tz)
-            if run_local.date() == today_local and run_local >= now_local:
-                upcoming_local_times.append(run_local)
+    for job in jq.get_jobs():
+        if job.name == f"msg_{uid}" and job.next_run_time:
+            utc = job.next_run_time.replace(tzinfo=timezone.utc)
+            loc = utc.astimezone(tz)
+            if loc.date() == today and loc >= now_local:
+                upcoming.append(loc)
 
-    upcoming_local_times.sort()
+    upcoming.sort()
 
-    planned = settings.planned_today
-    sent = settings.sent_today
-    remaining = max(planned - sent, 0)
+    msg = [
+        "📊 Статус на сегодня:\n",
+        f"Часовой пояс: GMT{settings.tz_offset:+d}",
+        f"Диапазон: {settings.start_hour}–{settings.end_hour}",
+        f"Уведомлений в день: {settings.count}\n",
+        f"Сегодня отправлено: {settings.sent_today}",
+        f"Запланировано на день: {settings.planned_today}",
+        f"Осталось: {max(settings.planned_today - settings.sent_today, 0)}\n",
+    ]
 
-    lines = []
-    lines.append("📊 Статус на сегодня:\n")
-    lines.append(f"Часовой пояс: GMT{settings.tz_offset:+d}")
-    lines.append(f"Диапазон: {settings.start_hour}–{settings.end_hour}")
-    lines.append(f"Уведомлений в день: {settings.count}\n")
-
-    lines.append(f"Сегодня отправлено: {sent}")
-    lines.append(f"Запланировано на день: {planned}")
-    lines.append(f"Осталось по плану: {remaining}\n")
-
-    if upcoming_local_times:
-        lines.append("Ближайшие уведомления (локальное время):")
-        for dt_loc in upcoming_local_times:
-            lines.append(f"👉 {dt_loc.strftime('%H:%M')}")
+    if upcoming:
+        msg.append("Ближайшие уведомления:")
+        msg += [f"👉 {t.strftime('%H:%M')}" for t in upcoming]
     else:
-        if planned == 0:
-            lines.append("На сегодня ещё нет плана (перезапусти /start или дождись полуночи).")
-        elif remaining == 0:
-            lines.append("На сегодня все уведомления уже отправлены.")
-        else:
-            lines.append(
-                "На сегодня запланированных уведомлений в очереди не видно "
-                "(возможно, окно уже прошло или всё было разослано)."
-            )
+        msg.append("На сегодня больше уведомлений нет.")
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(msg))
 
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Простой health-check: показывает, что бот жив и время на сервере."""
-    now_utc = datetime.now(timezone.utc)
-    await update.message.reply_text(f"pong 🧘\nUTC: {now_utc.isoformat()}")
+# ===================== ТЕКСТ-ОБРАБОТЧИК =====================
 
-
-# ===================== ОБРАБОТКА ТЕКСТА (настройки) =====================
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
         return
 
-    user = update.effective_user
-    uid = user.id
+    uid = update.effective_user.id
     text = update.message.text.strip()
 
     mode = context.user_data.get("mode")
     if not mode:
         return
 
-    settings = USERS.get(uid)
-    if not settings:
-        settings = UserSettings()
-        USERS[uid] = settings
-
+    settings = USERS.get(uid) or UserSettings()
+    USERS[uid] = settings
     app = context.application
 
     if mode == "set_tz":
         try:
-            if text.startswith("GMT") or text.startswith("gmt"):
-                text_clean = text[3:].strip()
-            else:
-                text_clean = text
-
-            tz_val = int(text_clean)
-        except ValueError:
-            await update.message.reply_text("Неверный формат. Попробуй ещё раз. Пример: +11")
+            if text.lower().startswith("gmt"):
+                text = text[3:].strip()
+            tz = int(text)
+        except:
+            await update.message.reply_text("Неверный формат. Пример: +11")
             return
 
-        if tz_val < -12 or tz_val > 14:
-            await update.message.reply_text("Диапазон GMT от -12 до +14. Попробуй ещё раз.")
+        if tz < -12 or tz > 14:
+            await update.message.reply_text("Допустимый диапазон: -12…+14")
             return
 
-        settings.tz_offset = tz_val
+        settings.tz_offset = tz
         save_users()
-
         clear_user_jobs(app, uid)
-        # При смене часового пояса оставляем статистику, но перепланируем остаток дня
         plan_today(app, uid, settings, reset_sent=False)
         schedule_midnight(app, uid, settings)
 
         context.user_data["mode"] = None
-        await update.message.reply_text(f"Окей, часовой пояс: GMT{tz_val:+d}. План на день обновлён.")
+        await update.message.reply_text(f"Окей, GMT{tz:+d}. План обновлён.")
         return
 
     if mode == "set_time":
         parts = text.replace(",", " ").split()
         if len(parts) != 2:
-            await update.message.reply_text("Неверный формат. Нужны два числа, пример: 9 19")
+            await update.message.reply_text("Формат: 9 19")
             return
-
         try:
-            start_h = int(parts[0])
-            end_h = int(parts[1])
-        except ValueError:
-            await update.message.reply_text("Неверный формат. Используй целые часы, пример: 9 19")
+            s, e = int(parts[0]), int(parts[1])
+        except:
+            await update.message.reply_text("Нужны числа, пример: 9 19")
             return
 
-        if not (0 <= start_h <= 23 and 0 <= end_h <= 24):
-            await update.message.reply_text("Часы должны быть в диапазоне 0–24. Попробуй ещё раз.")
+        if not (0 <= s < 24 and 0 < e <= 24) or s >= e:
+            await update.message.reply_text("Часы неверные. Пример: 9 19")
             return
 
-        if start_h >= end_h:
-            await update.message.reply_text("Начало должно быть меньше конца. Пример: 9 19")
-            return
-
-        settings.start_hour = start_h
-        settings.end_hour = end_h
+        settings.start_hour = s
+        settings.end_hour = e
         save_users()
 
         clear_user_jobs(app, uid)
-        # Перепланируем только остаток дня
         plan_today(app, uid, settings, reset_sent=False)
         schedule_midnight(app, uid, settings)
 
         context.user_data["mode"] = None
-        await update.message.reply_text(
-            f"Диапазон обновлён: с {start_h}:00 до {end_h}:00. План на сегодня пересчитан."
-        )
+        await update.message.reply_text(f"Диапазон обновлён: {s}:00–{e}:00")
         return
 
     if mode == "set_count":
         try:
-            cnt = int(text)
-        except ValueError:
-            await update.message.reply_text("Неверный формат. Нужна только цифра, пример: 5")
+            c = int(text)
+        except:
+            await update.message.reply_text("Нужна цифра, пример: 5")
             return
 
-        if not (MIN_COUNT <= cnt <= MAX_COUNT):
+        if not (MIN_COUNT <= c <= MAX_COUNT):
             await update.message.reply_text(
-                f"Допустимый диапазон: от {MIN_COUNT} до {MAX_COUNT}. Попробуй ещё раз."
+                f"Допустимо {MIN_COUNT}–{MAX_COUNT}"
             )
             return
 
-        settings.count = cnt
+        settings.count = c
         save_users()
 
         clear_user_jobs(app, uid)
-        # Количество изменилось – перепланируем остаток дня
         plan_today(app, uid, settings, reset_sent=False)
         schedule_midnight(app, uid, settings)
 
         context.user_data["mode"] = None
         await update.message.reply_text(
-            f"Окей, теперь буду слать {cnt} уведомлений в день. План на сегодня обновлён."
+            f"Теперь буду слать {c} уведомлений."
         )
-        return
+
+
+# ===================== Health-check сервер =====================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def start_health_server():
+    port = 10000
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+
+    def run():
+        log.info("Health server running on port %s", port)
+        server.serve_forever()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
 
 
 # ===================== STARTUP =====================
 
 async def on_startup(app: Application) -> None:
-    """
-    При старте:
-    - грузим пользователей
-    - для каждого пользователя чистим джобы и перепланируем напоминания
-      на текущий день, с учётом того, наступил ли новый день.
-    """
     load_users()
-    now_utc = datetime.now(timezone.utc).date()
-    now_utc_str = now_utc.isoformat()
+    now = datetime.now(timezone.utc).date().isoformat()
 
     for uid, settings in USERS.items():
         clear_user_jobs(app, uid)
-
-        same_day = (settings.last_plan_date_utc == now_utc_str)
-        reset = not same_day
-
-        log.info(
-            "[%s] Startup: last_plan_date_utc=%s, today_utc=%s, same_day=%s,"
-            " planned_today=%d, sent_today=%d, reset=%s",
-            uid,
-            settings.last_plan_date_utc,
-            now_utc_str,
-            same_day,
-            settings.planned_today,
-            settings.sent_today,
-            reset,
-        )
-
-        plan_today(app, uid, settings, reset_sent=reset)
+        same_day = settings.last_plan_date_utc == now
+        plan_today(app, uid, settings, reset_sent=not same_day)
         schedule_midnight(app, uid, settings)
 
-    log.info("Startup finished: users planned and midnight jobs scheduled")
+    log.info("Startup planning complete")
 
 
-def main() -> None:
+# ===================== MAIN =====================
+
+def main():
     if not TOKEN:
-        log.error("ERROR: BOT_TOKEN is not set in environment")
+        log.error("BOT_TOKEN missing")
         return
 
-    app = Application.builder().token(TOKEN).build()
+    start_health_server()
 
-    # startup-хук
+    app = Application.builder().token(TOKEN).build()
     app.post_init = on_startup
 
-    # хендлеры команд
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("settz", cmd_settz))
     app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CommandHandler("setcount", cmd_setcount))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("ping", cmd_ping))
-
-    # текст – только как ответ на режимы настройки
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Настройки webhook для Render
     port = int(os.environ.get("PORT", "1000"))
-    secret_path = os.environ.get("WEBHOOK_PATH", "mindfulness-secret").lstrip("/")
-    base_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    secret = os.environ.get("WEBHOOK_PATH", "mindfulness-secret").lstrip("/")
+    base = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 
-    if not base_url:
-        base_url = "https://mindfulness-bot.onrender.com"
+    if not base:
+        base = "https://mindfulness-bot.onrender.com"
 
-    webhook_url = f"{base_url}/{secret_path}"
-
-    log.info("Starting webhook on port %s, url: %s", port, webhook_url)
+    webhook_url = f"{base}/{secret}"
+    log.info("Starting webhook on %s", webhook_url)
 
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
-        url_path=secret_path,
+        url_path=secret,
         webhook_url=webhook_url,
     )
 
