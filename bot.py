@@ -183,7 +183,6 @@ def plan_today(app: Application, uid: int, settings: UserSettings, reset_sent: b
         )
     else:
         # День тот же, рестарт/перепланировка
-        # План на день не трогаем, только следим за консистентностью
         if settings.planned_today < settings.sent_today:
             settings.planned_today = settings.sent_today
         if settings.planned_today == 0:
@@ -279,7 +278,8 @@ def schedule_midnight(app: Application, uid: int, settings: UserSettings) -> Non
         name=f"midnight_{uid}",
         data={"uid": uid},
         job_kwargs={
-            "misfire_grace_time": MIN_OFFSET_MINUTES * 60,
+            # полуночная джоба не должна отваливаться, даже если сервис проснулся сильно позже
+            "misfire_grace_time": 60 * 60 * 24,  # 24 часа
             "coalesce": False,
         },
     )
@@ -302,8 +302,10 @@ async def job_send_message(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(chat_id=uid, text=text)
         settings.sent_today += 1
         save_users()
-        log.info("Sent msg to %s. Sent today: %d (planned_today=%d)",
-                 uid, settings.sent_today, settings.planned_today)
+        log.info(
+            "Sent msg to %s. Sent today: %d (planned_today=%d)",
+            uid, settings.sent_today, settings.planned_today
+        )
     except Exception as e:
         log.error("Failed to send message to %s: %s", uid, e)
 
@@ -570,8 +572,8 @@ async def on_startup(app: Application) -> None:
     """
     При старте:
     - грузим пользователей
-    - для каждого пользователя чистим джобы и перепланируем оставшиеся напоминания
-      на ТЕКУЩИЙ день без сброса счётчика.
+    - для каждого пользователя чистим джобы и перепланируем напоминания
+      на текущий день, с учётом того, наступил ли новый день.
     """
     load_users()
     now_utc = datetime.now(timezone.utc).date()
@@ -581,19 +583,21 @@ async def on_startup(app: Application) -> None:
         clear_user_jobs(app, uid)
 
         same_day = (settings.last_plan_date_utc == now_utc_str)
+        reset = not same_day
+
         log.info(
             "[%s] Startup: last_plan_date_utc=%s, today_utc=%s, same_day=%s,"
-            " planned_today=%d, sent_today=%d",
+            " planned_today=%d, sent_today=%d, reset=%s",
             uid,
             settings.last_plan_date_utc,
             now_utc_str,
             same_day,
             settings.planned_today,
             settings.sent_today,
+            reset,
         )
 
-        # Не сбрасываем sent_today на старте, только допланируем остаток дня.
-        plan_today(app, uid, settings, reset_sent=False)
+        plan_today(app, uid, settings, reset_sent=reset)
         schedule_midnight(app, uid, settings)
 
     log.info("Startup finished: users planned and midnight jobs scheduled")
